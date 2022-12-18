@@ -55,13 +55,6 @@ where
             .and_then(|r| r.get(context))
     }
 
-    fn get_registry(&mut self, key: Rc<K>) -> &mut Registry<C, V> {
-        if !self.keys_to_registries.contains_key(&key) {
-            self.keys_to_registries.insert(key.clone(), Registry::new());
-        }
-        self.keys_to_registries.get_mut(&key).unwrap()
-    }
-
     pub fn update_overwrite(
         &mut self,
         key: Rc<K>,
@@ -98,5 +91,12 @@ where
         new_registry.update(context, Some(value.clone()))?;
         self.values_to_keys.try_insert(value, key).unwrap();
         Ok(())
+    }
+
+    fn get_registry(&mut self, key: Rc<K>) -> &mut Registry<C, V> {
+        if !self.keys_to_registries.contains_key(&key) {
+            self.keys_to_registries.insert(key.clone(), Registry::new());
+        }
+        self.keys_to_registries.get_mut(&key).unwrap()
     }
 }
