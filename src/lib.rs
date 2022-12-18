@@ -68,8 +68,8 @@ where
         context: C,
         value: Rc<V>,
     ) -> Result<(), &'static str> {
-        if let Some(k) = self.values_to_keys.get(&value) {
-            let old_registry = self.keys_to_registries.get_mut(k).unwrap();
+        if let Some(old_key) = self.values_to_keys.get(&value) {
+            let old_registry = self.keys_to_registries.get_mut(old_key).unwrap();
             old_registry.update(context.clone(), None)?;
             self.values_to_keys.remove(&value);
         }
