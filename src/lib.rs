@@ -18,7 +18,7 @@ where
 
     fn get(&self, context: &C) -> Option<Rc<V>> {
         self.0
-            .range(..=context) // Get all pairs (inclusive) context
+            .range(..=context) // Get all pairs until (inclusive) context
             .next_back() // Take the last one
             .and_then(|(_c, v)| v.clone()) // take the value and upgrade to an owned Rc<V>
     }
