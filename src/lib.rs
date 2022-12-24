@@ -102,6 +102,32 @@ impl<C: Ord, V> Registry<C, V> {
     }
 }
 
+
+impl<C: Ord, V> ContextRegistry<C, V> {
+
+} 
+
+
+enum InsertionCommand<'a, L, C, V> {
+    // new.context == existing.context && new.value.is_some() && existing.value.is_none(None)
+    Overwrite {
+        link: Rc<L>,
+        new_values_to_links_entry: hash_map::Entry<Rc<V>, Rc<C>>
+        existing_record: btree_map::OccupiedEntry<'a, Rc<C>, Option<Rc<V>>>,
+        new_value: Option<Rc<V>>,
+    }, 
+    // new.context > existing.context && new.value != existing value
+    Update {
+        link: Rc<L>,
+        new_values_to_links_entry: hash_map::Entry<Rc<V>, Rc<C>>
+        new_entry: btree_map::VacantEntry<'a, Rc<C>, Option<Rc<V>>>,
+        new_value: Option<Rc<V>>,
+        last_value: Option<Rc<V>>,
+    },
+    // new.value == existing.value
+    NoChange,
+}
+
 #[derive(Debug)]
 enum RecordToEntryError<'a, C, V> {
     OutdatedContext{
