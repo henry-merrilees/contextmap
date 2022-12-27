@@ -1,251 +1,392 @@
 #![feature(
+    map_many_mut,
     entry_insert,
     is_some_and,
     let_chains,
     map_try_insert,
     specialization,
-    type_changing_struct_update,
+    type_changing_struct_update
 )]
-use std::cmp::Ordering;
-use std::collections::btree_map::{self, Entry};
-use std::collections::hash_map;
+use std::borrow::BorrowMut;
+use std::cell::RefCell;
+use std::collections::{btree_map, hash_map};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::fmt::{Display, Debug};
+use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::rc::Rc;
 
-struct Record<C, V> {
-    context: C,
-    value: V,
+struct ContextRecord<C: Ord, L, V> {
+    context: Rc<C>,
+    link: Rc<L>,
+    value: Option<Rc<V>>,
 }
 
-impl<C: Debug, V: Debug> Debug for Record<C, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Record {context, value} = self;
-        write!(f, "Record {{ {value:?} @ {context:?} }}")
-    }
+type ContextRegistry<C, L, V> = BTreeMap<Rc<C>, ContextRecord<C, L, V>>;
+
+//  Rules:
+//  - Records:
+//    - A context, link and an optional value.
+//  - Registries:
+//    - An ordered map of records.
+//    - The "value" of a record is the value of its most recent record (a None-valued record
+//    means a none-valued registry)
+//    - Write-only
+//    - Records are inserted in cronological order
+//
+//  - ContextMap:
+//    - Points links to registries
+//    - Points values to the registries of the same ("live") value.
+//    - No two registries may have the same link.
+//    - No two registries may have the same value.
+//    - Registries should be inserted into the contextmap only with a single some-valued record;
+//    this way the insertion logic of the registry follows the insertion logic of its record.
+//
+//  Operations:
+//  - No change: submitting a record with this link and value would not change the outputs of the
+//  map for any context.
+//  - NewLink: the link has never existed in the map.
+//  - Nullify: enters a None record at a more recent context. (Enables an overwrite/update)
+//  - Overwrite: replaces the last record's None with some value.
+//  - Update: Writes a new Some value at a more recent context.
+//
+//  - the link-to-registry and value-to-registry entries must not both contain the same registry.
+//  If we can gaurantee this rule, we can borrow mutably from either without worry that we have
+//  already mutably borrowed the same RefCell from the other.
+//
+//
+//
+//  Guarantees:
+//  - Registries:
+//    - After a record has been inserted at a context, any query context not later than the last
+//    inserted context will return the same value (bc write-only & chronological insertion rule).
+//    - For space eficciency, we can regard an inserted record with the same value as the last
+//    record as a no-op without erroring, (as query returns most recent, it does not change result
+//    for any context)
+//  - Update:
+//    - the link_
+//
+pub struct ContextMap<L, C: Ord, V> {
+    links_to_registries: HashMap<Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
+    values_to_registries: HashMap<Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
 }
 
-impl<C, V> From<(C, V)> for Record<C, V> {
-    fn from((context, value): (C, V)) -> Self {
-        Self { context, value }
-    }
+trait Command
+where
+    Self: Sized,
+{
+    fn execute(self) {}
 }
 
-impl<C: Clone, V: Clone> Clone for Record<C, V> {
-    fn clone(&self) -> Self {
-        let Self { context, value } = self;
-        Self {
+/// Add new link with `Some<V>`.
+struct NewLinkCommand<'a, C: Ord, L, V> {
+    context: Rc<C>,
+    link: Rc<L>,
+    value: Rc<V>, // Enforcing value must be Some
+    new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
+    links_to_registries_entry:
+        hash_map::VacantEntry<'a, Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
+    value_command: ValueCommand<'a, C, L, V>,
+}
+
+impl<'a, C: Ord, L, V> Command for NewLinkCommand<'a, C, L, V> {
+    fn execute(self) {
+        let NewLinkCommand {
+            context,
+            link,
+            value,
+            new_registry,
+            links_to_registries_entry,
+            value_command,
+        } = self;
+
+        let record: ContextRecord<C, L, V> = ContextRecord {
             context: context.clone(),
-            value: value.clone(),
+            link,
+            value: Some(value),
+        };
+
+        {
+            new_registry.get_mut().insert(context, record);
         }
-    }
-}
-impl<C, V> From<std::collections::btree_map::OccupiedEntry<'_, Rc<C>, Option<Rc<V>>>> for &Record<C, V> {
-    fn from(value: std::collections::btree_map::OccupiedEntry<'_, Rc<C>, Option<Rc<V>>>) -> Self {
-       
-    }
-}
-impl<C: Ord + Clone, V: Clone> From<btree_map::OccupiedEntry<'_, C, V>> for Record<C, V> {
-    fn from(entry: btree_map::OccupiedEntry<C, V>) -> Self {
-        Self {
-            context: entry.key().clone(),
-            value: entry.get().clone(),
-        }
+
+        links_to_registries_entry.insert(new_registry);
+
+        value_command.execute()
     }
 }
 
-impl<C, V> From<Record<C, V>> for Record<C, Option<V>> {
-    fn from(Record { context, value }: Record<C, V>) -> Self {
-        Self {
-            context: context.into(),
-            value: Some(value.into()),
-        }
+/// Update a link pointing to a record with value `Some<V>` to a newer record with a different
+/// value `Some<V>`.
+struct UpdateCommand<'a, C: Ord, L, V> {
+    link: Rc<L>,
+    context: Rc<C>,
+    value: Rc<V>, // Enforcing value must be Some
+    context_registry: &'a mut ContextRegistry<C, L, V>,
+    value_command: ValueCommand<'a, C, L, V>,
+}
+
+impl<'a, C: Ord, L, V> Command for UpdateCommand<'a, C, L, V> {
+    fn execute(self) {
+        let UpdateCommand {
+            link,
+            context,
+            value,
+            context_registry,
+            value_command,
+        } = self;
+
+        let record = ContextRecord {
+            link,
+            context: context.clone(),
+            value: Some(value),
+        };
+
+        context_registry.insert(context, record);
+
+        value_command.execute();
     }
 }
 
-impl<C, V> From<Record<C, V>> for Record<Rc<C>, Rc<V>> {
-    fn from(Record { context, value }: Record<C, V>) -> Self {
-        Self {
-            context: context.into(),
-            value: value.into(),
-        }
+/// Command to update a link with a None value
+struct NullifyCommand<'a, C: Ord, L, V> {
+    link: Rc<L>,
+    context: Rc<C>,
+    values_to_registries_entry:
+        hash_map::OccupiedEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
+}
+
+impl<'a, C: Ord, L, V> NullifyCommand<'a, C, L, V> {
+    fn execute(self) {
+        let NullifyCommand {
+            link,
+            context,
+            values_to_registries_entry,
+        } = self;
+
+        let record = ContextRecord {
+            link,
+            context: context.clone(),
+            value: Option::<Rc<V>>::None,
+        };
+
+        values_to_registries_entry
+            .get()
+            .get_mut()
+            .insert(context, record);
+        values_to_registries_entry.remove();
     }
 }
 
-struct Registry<C: Ord, V> {
-    records: BTreeMap<C, V>,
+/// Command to fill an existing Record value None with Some value.
+pub struct OverwriteCommand<'a, C: Ord, L, V> {
+    value: Rc<V>,
+    registry_entry: btree_map::OccupiedEntry<'a, Rc<C>, ContextRecord<C, L, V>>,
+    value_command: ValueCommand<'a, C, L, V>,
 }
 
-impl<C: Ord, V> Registry<C, V> {
-    fn new() -> Self {
-        Self {
-            records: BTreeMap::new(),
-        }
-    }
+impl<'a, C: Ord, L, V> Command for OverwriteCommand<'a, C, L, V> {
+    fn execute(self) {
+        let OverwriteCommand {
+            value,
+            mut registry_entry,
+            value_command,
+        } = self;
 
-    pub fn get(&self, context: C) -> Option<Record<&C, &V>> {
-        self.records.range(..=context).next_back().map(Record::from)
-    }
+        registry_entry.get_mut().value = Some(value);
 
-    pub fn get_recent(&self) -> Option<Record<&C, &V>> {
-        self.records.last_key_value().map(Into::into)
-    }
-
-    pub fn entry(&mut self, context: C) -> Entry<'_, C, V> {
-        self.records.entry(context)
-    }
-
-    pub fn last_entry(&mut self) -> Option<btree_map::OccupiedEntry<'_, C, V>> {
-        self.records.last_entry()
+        value_command.execute();
     }
 }
 
-
-impl<C: Ord, V> ContextRegistry<C, V> {
-
-} 
-
-
-enum InsertionCommand<'a, L, C, V> {
-    // new.context == existing.context && new.value.is_some() && existing.value.is_none(None)
-    Overwrite {
-        link: Rc<L>,
-        new_values_to_links_entry: hash_map::Entry<Rc<V>, Rc<C>>
-        existing_record: btree_map::OccupiedEntry<'a, Rc<C>, Option<Rc<V>>>,
-        new_value: Option<Rc<V>>,
-    }, 
-    // new.context > existing.context && new.value != existing value
-    Update {
-        link: Rc<L>,
-        new_values_to_links_entry: hash_map::Entry<Rc<V>, Rc<C>>
-        new_entry: btree_map::VacantEntry<'a, Rc<C>, Option<Rc<V>>>,
-        new_value: Option<Rc<V>>,
-        last_value: Option<Rc<V>>,
-    },
-    // new.value == existing.value
+/// ## InsertionCommands are determined by the following:
+///
+/// Link does not exist: [`NewLink`](InsertionCommand::NewLink) (`Some(value)`, any context)
+///
+/// Link Exists:  
+///
+/// | ↓ value / context →         | Same Context                               | Later Context                          |
+/// |-----------------------------|--------------------------------------------|----------------------------------------|
+/// | `None` -> `Some(new_value)` | [`Overwrite`](InsertionCommand::Overwrite) | [`Update`](InsertionCommand::Update)   |
+/// | `Some(old_value)` -> `None` | N/A (Destructive)                          | [`Nullify`](InsertionCommand::Nullify) |
+///
+///
+/// All commands that insert `Some<V>`, i.e., [`NewLink`](InsertionCommand::NewLink),
+/// [`Overwrite`](InsertionCommand::Overwrite), [`Update`](), may clash with existing links, which,
+/// if existing, must be Nullified. As nullifying a ContextRegistry does not link `Some(V)`, it will
+/// not clash. As such, every insertion operation should trigger at most two commands, the first to
+/// associate the new link with the value, the second to nullify the old link.
+enum InsertionCommand<'a, C: Ord, L, V> {
+    NewLink(NewLinkCommand<'a, C, L, V>),
+    Update(UpdateCommand<'a, C, L, V>),
+    Nullify(NullifyCommand<'a, C, L, V>),
+    Overwrite(OverwriteCommand<'a, C, L, V>),
     NoChange,
 }
 
-#[derive(Debug)]
-enum RecordToEntryError<'a, C, V> {
-    OutdatedContext{
-        existing_record: &'a Record<C, V>,
-        entered_context: &'a C,
-    },
-    OverwritingSome{
-        existing_record: &'a Record<C, V>,
-        entered_context: &'a C,
-    },
-}
-
-const INTRO: &'static str = "Insertions are possible only when the most recent existing record\r\t(1) has less recent context than the record to be inserted, or\r\t(2) is equally recent to the most recent existing record which has a value of None.";
-
-impl<'a, C, V> Display for RecordToEntryError<'a, Rc<C>, Option<Rc<V>>> {
-    default fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'a, C: Ord, L, V> Command for InsertionCommand<'a, C, L, V> {
+    fn execute(self) {
         match self {
-            RecordToEntryError::OutdatedContext { existing_record, entered_context } => {
-                write!(f, "Inserted record must not have an eariler context than the latest existing record.\r\r{INTRO}")
-            },
-            RecordToEntryError::OverwritingSome { existing_record, entered_context } => {
-                write!(f, "Inserted record is equally recent (same context) but value is not None.\r\r{INTRO}")
-            },
+            InsertionCommand::NewLink(command) => command.execute(),
+            InsertionCommand::Update(command) => command.execute(),
+            InsertionCommand::Nullify(command) => command.execute(),
+            InsertionCommand::Overwrite(command) => command.execute(),
+            InsertionCommand::NoChange => {}
         }
     }
 }
 
-impl<'a, C: Debug, V: Debug> Display for RecordToEntryError<'a, Rc<C>, Option<Rc<V>>> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+enum ValueCommand<'a, C: Ord, L, V> {
+    Vacant {
+        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
+        vacant_values_to_registries_entry:
+            hash_map::VacantEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
+    },
+    Occupied {
+        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
+        vacant_values_to_registries_entry:
+            hash_map::VacantEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
+        nullify_command: NullifyCommand<'a, C, L, V>,
+    },
+}
+
+
+impl<'a, C: Ord, L, V> Command for ValueCommand<'a, C, L, V> {
+    fn execute(self) {
         match self {
-            RecordToEntryError::OutdatedContext { existing_record, entered_context } => {
-                write!(f, "Inserted record (@ {entered_context:?}) must not have an eariler context than the latest existing record ({existing_record:?}).\r\r{INTRO}")
-            },
-            RecordToEntryError::OverwritingSome { existing_record, entered_context } => {
-                write!(f, "Inserted record is equally recent (@ {entered_context:?}) to the existing record but its value ({:?}) is not None.\r\r{INTRO}", existing_record.value)
-            },
-        }
-    }
-}
-
-
-impl<'a, C: Debug, V: Debug> std::error::Error for RecordToEntryError<'a, C, V> where Self: Display {}
-
-impl<C: Ord, V> Registry<Rc<C>, Option<Rc<V>>> {
-    fn record_to_entry(
-        &mut self,
-        record: Record<Rc<C>, Option<Rc<V>>>,
-    ) -> Result<btree_map::Entry<Rc<C>, Option<Rc<V>>>, RecordToEntryError<C, V>> {
-        let last_entry = self
-            .last_entry()
-            .expect("TODO: there should never be an empty Registry.");
-
-        match (record.context.cmp(last_entry.key()), last_entry.get()) {
-        (Ordering::Less, _) => Err(RecordToEntryError::OutdatedContext { existing_record: last_entry.into(), entered_context: &record.context }),
-        (Ordering::Equal, &Some(_)) => Err(RecordToEntryError::OverwritingSome { existing_record: last_entry.into(), entered_context: &record.context}),
-        _ => Ok(self.entry(record.context)), // All else is okay
-        }
-    }
-}
-
-type ContextRegistry<C, V> = Registry<Rc<C>, Option<Rc<V>>>;
-
-struct ContextMap<L, C: Ord, V> {
-    links_to_registries: HashMap<Rc<L>, ContextRegistry<C, V>>,
-    values_to_links: HashMap<Rc<V>, Rc<L>>,
-}
-
-impl<L, C, V> ContextMap<L, C, V> where L: PartialEq + Eq + Hash, C: Ord, V: Hash + Eq {
-    fn new() -> Self {
-        let links_to_registries = HashMap::<Rc<L>, ContextRegistry<C, V>>::new();
-        let values_to_links = HashMap::<Rc<V>, Rc<L>>::new();
-        Self {
-            links_to_registries,
-            values_to_links,
-        }
-    }
-
-    pub fn insert<'a>(&mut self, link: L, record: Record<C, V>) -> Result<(), Box<dyn Error>> {
-        let record: Record<Rc<C>, Rc<V>> = record.into();
-        // Check for different link that points to the same value. We need to write a new None entry
-        let overwrite_value_record_result: Result<
-            Option<btree_map::Entry<Rc<C>, Option<Rc<V>>>>,
-            RecordToEntryError<C, V>,
-        > = match self.values_to_links.entry(record.value.clone()) {
-            hash_map::Entry::Vacant(_) => Ok(None),
-            hash_map::Entry::Occupied(occupied_entry_link) => {
-                let key: &Rc<L> = occupied_entry_link.get();
-                let mut registry = self.links_to_registries.get_mut(key).expect("If this is reached, a {{link: value}} was not properly added to self.values_to_links.");
-                registry.record_to_entry(record.clone().into()).map(Some)
+            ValueCommand::Vacant {
+                new_registry,
+                vacant_values_to_registries_entry,
+            } => {
+                vacant_values_to_registries_entry.insert(new_registry);
             }
-        };
+            ValueCommand::Occupied {
+                new_registry,
+                nullify_command,
+            } => {
+                nullify_command.execute();
+            }
+        }
+    }
+}
 
-        // Check for records with earlier contexts
-        //
-        let mut binding: hash_map::OccupiedEntry<Rc<L>, Registry<Rc<C>, Option<Rc<V>>>>;
-        let overwrite_link_record_result: Result<btree_map::Entry<Rc<C>, Option<Rc<V>>>, RecordToEntryError<C, V>> =
-            match self.links_to_registries.entry(Rc::new(link)) {
-                hash_map::Entry::Occupied(ref mut occupied_entry) => {
-                    let registry = occupied_entry.get_mut();
-                    registry.record_to_entry(record.into())
+#[derive(Debug)]
+enum RecordToEntryError {
+    OutdatedContext,
+    OverwritingSome,
+}
+
+impl Display for RecordToEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for RecordToEntryError {}
+
+impl<L, C, V> ContextMap<L, C, V>
+where
+    L: PartialEq + Eq + Hash,
+    C: Ord + Debug,
+    V: Hash + Eq + Debug,
+{
+    fn new() -> Self {
+        Self {
+            links_to_registries: HashMap::<Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>::new(),
+            values_to_registries: HashMap::<Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>::new(),
+        }
+    }
+
+    fn gen_value_command<'a>(
+        &mut self,
+        link: Rc<L>,
+        context: Rc<C>,
+        new_value: Rc<V>,
+        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>, 
+    ) -> ValueCommand<'a, C, L, V> {
+        let entry = self.values_to_registries.entry(new_value);
+        match entry {
+            hash_map::Entry::Occupied(occupied_entry) => ValueCommand::Occupied {
+                new_registry,
+                nullify_command: NullifyCommand {
+                    link,
+                    context,
+                    values_to_registries_entry: occupied_entry,
+                },
+            },
+            hash_map::Entry::Vacant(vacant_entry) => ValueCommand::Vacant {
+                vacant_values_to_registries_entry: vacant_entry,
+            },
+        }
+    }
+
+    fn generate_command(
+        &mut self,
+        context: Rc<C>,
+        link: Rc<L>,
+        value: Rc<V>,
+    ) -> Result<InsertionCommand<C, L, V>, RecordToEntryError> {
+        // So long as we can assure that we never pass the same
+        let linked_registry_entry = self.links_to_registries.entry(link);
+        let valued_registry_entry = self.values_to_registries.entry(value);
+
+        match (linked_registry_entry, valued_registry_entry) {
+            (
+                hash_map::Entry::Occupied(linked_registry_occupied),
+                hash_map::Entry::Occupied(valued_registry_occupied),
+            ) => {
+                if std::ptr::eq(
+                    linked_registry_occupied.get(),
+                    valued_registry_occupied.get(),
+                ) {
+                    // The link and value already point to the same registry, they are already associated.
+                    return Ok(InsertionCommand::NoChange);
+                } else {
+                    let value_command = todo!();
+                    let update_command = UpdateCommand {
+                        link,
+                        context,
+                        value,
+                        value_command,
+                        context_registry: linked_registry_occupied.get().get_mut(),
+                    };
+                    Ok(InsertionCommand::Update(update_command));
                 }
-                hash_map::Entry::Vacant(vacant_entry) => {
-                    binding = vacant_entry.insert_entry(Registry::new());
-                    Ok(binding.get_mut().entry(record.context))
-                }
-            };
-
-        match (overwrite_link_record_result, overwrite_value_record_result) {
-            (Ok(_), Ok(_)) => todo!(),
-            (Ok(_), Err(_)) => todo!(),
-            (Err(_), Ok(_)) => todo!(),
-            (Err(e1), Err(e2)) => Err(format!("{} and {}", e1, e2).into()),
-
-                Err(e1.to_string())
+            }
+            (
+                hash_map::Entry::Occupied(occupied_link_registry_entry),
+                hash_map::Entry::Occupied(occupied_value_registry_entry),
+            ) => {}
+            (hash_map::Entry::Occupied(_), hash_map::Entry::Vacant(_)) => {
+                // link registry => Ok: update, overwrite || Err: overwritesome, or context
+            }
+            (hash_map::Entry::Vacant(_), hash_map::Entry::Occupied(_)) => todo!(),
+            (hash_map::Entry::Vacant(_), hash_map::Entry::Vacant(_)) => todo!(),
         }
 
-        // If we write a newer record, we should remove the old value from values_to_links
+        // is there an existing link (if not, NewLink, otherwise, can we overwrite / update?)
+        // does the value exist in another link
 
-        // Register new value in values_to_links
+        // if let hash_map::Entry::Occupied(occupied_value_registry_entry) = value_registry_entry
+        // && let  Some((old_value_context, _)) = occupied_value_registry_entry.get().borrow().last_key_value()
+        // && &context < old_value_context {
+        // return Err(RecordToEntryError::OutdatedContext);
+        // };
+    }
+
+    fn insert_record(&mut self, link: L, record: ContextRecord<C, L, V>)
+    /*  -> Result<(), Box<dyn Error>> */
+    {
+        let link_registry = self.links_to_registries.get(&link);
+        let value_registry = record.value.and_then(|v| self.values_to_registries.get(&v));
+
+        match (link_registry, value_registry) {
+            //Need to create new registry.
+            (None, None) => link_registry = todo!(),
+            (None, Some(value_registry)) => todo!(),
+            (None, Some(value_registry)) => todo!(),
+            (Some(_), None) => todo!(),
+            (Some(_), Some(_)) => todo!(),
+        }
     }
 }
