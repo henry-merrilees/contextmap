@@ -1,28 +1,112 @@
 #![feature(
     map_many_mut,
+    map_entry_replace,
     entry_insert,
     is_some_and,
     let_chains,
     map_try_insert,
-    specialization,
     type_changing_struct_update
 )]
-use std::borrow::BorrowMut;
 use std::cell::RefCell;
-use std::collections::{btree_map, hash_map};
+use std::cmp::{Ord, Ordering};
+use std::collections::hash_map;
 use std::collections::{BTreeMap, HashMap};
-use std::error::Error;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::hash::Hash;
+use std::ops::RangeToInclusive;
 use std::rc::Rc;
 
-struct ContextRecord<C: Ord, L, V> {
+/// The core unit of a hashmap
+#[derive(Debug)]
+pub struct ContextRecord<C: Ord, L, V> {
     context: Rc<C>,
     link: Rc<L>,
     value: Option<Rc<V>>,
 }
 
-type ContextRegistry<C, L, V> = BTreeMap<Rc<C>, ContextRecord<C, L, V>>;
+impl<C: Ord, L, V> Clone for ContextRecord<C, L, V> {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            link: self.link.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<C: Ord, L, V> ContextRecord<C, L, V> {
+    /// Create a new record with a `Some` value
+    fn new_some(context: &Rc<C>, link: &Rc<L>, value: &Rc<V>) -> Self {
+        let context = context.clone();
+        let link = link.clone();
+        let value = value.clone();
+
+        Self {
+            context,
+            link,
+            value: Some(value),
+        }
+    }
+
+    /// Create a new record with a `None` value
+    fn new_none(context: &Rc<C>, link: &Rc<L>) -> Self {
+        let context = context.clone();
+        let link = link.clone();
+        Self {
+            context,
+            link,
+            value: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ContextRegistry<C: Ord, L, V> {
+    records: BTreeMap<Rc<C>, ContextRecord<C, L, V>>,
+}
+
+impl<C: Ord, L, V> ContextRegistry<C, L, V> {
+    pub fn insert(
+        &mut self,
+        context: Rc<C>,
+        record: ContextRecord<C, L, V>,
+    ) -> Option<ContextRecord<C, L, V>> {
+        self.records.insert(context, record)
+    }
+
+    pub fn query(&self, context: &C) -> Option<&ContextRecord<C, L, V>> {
+        self.records.range::<C, RangeToInclusive<&C>>(..=context).next_back().map(|(_c, v)| v)
+    }
+
+    fn get_mut(&mut self, context: &C) -> Option<&mut ContextRecord<C, L, V>> {
+        self.records.get_mut(context)
+    }
+
+    fn new(context: Rc<C>, link: Rc<L>, value: Rc<V>) -> Self {
+        let record = ContextRecord::new_some(&context, &link, &value);
+        let mut records = BTreeMap::new();
+        records.insert(context, record);
+
+        Self { records }
+    }
+
+    fn last_key_value(&self) -> (&Rc<C>, &ContextRecord<C, L, V>) {
+        self.records
+            .last_key_value()
+            .expect("Registries are not created without records.")
+    }
+    fn last_record(&self) -> &ContextRecord<C, L, V> {
+        self.last_key_value().1
+    }
+
+    fn context(&self) -> Rc<C> {
+        self.last_record().context.clone()
+    }
+
+    fn value(&self) -> Option<Rc<V>> {
+        self.last_record().value.clone()
+    }
+}
 
 //  Rules:
 //  - Records:
@@ -32,7 +116,7 @@ type ContextRegistry<C, L, V> = BTreeMap<Rc<C>, ContextRecord<C, L, V>>;
 //    - The "value" of a record is the value of its most recent record (a None-valued record
 //    means a none-valued registry)
 //    - Write-only
-//    - Records are inserted in cronological order
+//    - Records are inserted in chronological order
 //
 //  - ContextMap:
 //    - Points links to registries
@@ -51,7 +135,7 @@ type ContextRegistry<C, L, V> = BTreeMap<Rc<C>, ContextRecord<C, L, V>>;
 //  - Update: Writes a new Some value at a more recent context.
 //
 //  - the link-to-registry and value-to-registry entries must not both contain the same registry.
-//  If we can gaurantee this rule, we can borrow mutably from either without worry that we have
+//  If we can ensure this rule, we can borrow mutably from either without worry that we have
 //  already mutably borrowed the same RefCell from the other.
 //
 //
@@ -60,144 +144,18 @@ type ContextRegistry<C, L, V> = BTreeMap<Rc<C>, ContextRecord<C, L, V>>;
 //  - Registries:
 //    - After a record has been inserted at a context, any query context not later than the last
 //    inserted context will return the same value (bc write-only & chronological insertion rule).
-//    - For space eficciency, we can regard an inserted record with the same value as the last
+//    - For space efficiency, we can regard an inserted record with the same value as the last
 //    record as a no-op without erroring, (as query returns most recent, it does not change result
 //    for any context)
 //  - Update:
 //    - the link_
 //
+#[derive(Debug)]
 pub struct ContextMap<L, C: Ord, V> {
     links_to_registries: HashMap<Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
     values_to_registries: HashMap<Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
 }
 
-trait Command
-where
-    Self: Sized,
-{
-    fn execute(self) {}
-}
-
-/// Add new link with `Some<V>`.
-struct NewLinkCommand<'a, C: Ord, L, V> {
-    context: Rc<C>,
-    link: Rc<L>,
-    value: Rc<V>, // Enforcing value must be Some
-    new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
-    links_to_registries_entry:
-        hash_map::VacantEntry<'a, Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
-    value_command: ValueCommand<'a, C, L, V>,
-}
-
-impl<'a, C: Ord, L, V> Command for NewLinkCommand<'a, C, L, V> {
-    fn execute(self) {
-        let NewLinkCommand {
-            context,
-            link,
-            value,
-            new_registry,
-            links_to_registries_entry,
-            value_command,
-        } = self;
-
-        let record: ContextRecord<C, L, V> = ContextRecord {
-            context: context.clone(),
-            link,
-            value: Some(value),
-        };
-
-        {
-            new_registry.get_mut().insert(context, record);
-        }
-
-        links_to_registries_entry.insert(new_registry);
-
-        value_command.execute()
-    }
-}
-
-/// Update a link pointing to a record with value `Some<V>` to a newer record with a different
-/// value `Some<V>`.
-struct UpdateCommand<'a, C: Ord, L, V> {
-    link: Rc<L>,
-    context: Rc<C>,
-    value: Rc<V>, // Enforcing value must be Some
-    context_registry: &'a mut ContextRegistry<C, L, V>,
-    value_command: ValueCommand<'a, C, L, V>,
-}
-
-impl<'a, C: Ord, L, V> Command for UpdateCommand<'a, C, L, V> {
-    fn execute(self) {
-        let UpdateCommand {
-            link,
-            context,
-            value,
-            context_registry,
-            value_command,
-        } = self;
-
-        let record = ContextRecord {
-            link,
-            context: context.clone(),
-            value: Some(value),
-        };
-
-        context_registry.insert(context, record);
-
-        value_command.execute();
-    }
-}
-
-/// Command to update a link with a None value
-struct NullifyCommand<'a, C: Ord, L, V> {
-    link: Rc<L>,
-    context: Rc<C>,
-    values_to_registries_entry:
-        hash_map::OccupiedEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
-}
-
-impl<'a, C: Ord, L, V> NullifyCommand<'a, C, L, V> {
-    fn execute(self) {
-        let NullifyCommand {
-            link,
-            context,
-            values_to_registries_entry,
-        } = self;
-
-        let record = ContextRecord {
-            link,
-            context: context.clone(),
-            value: Option::<Rc<V>>::None,
-        };
-
-        values_to_registries_entry
-            .get()
-            .get_mut()
-            .insert(context, record);
-        values_to_registries_entry.remove();
-    }
-}
-
-/// Command to fill an existing Record value None with Some value.
-pub struct OverwriteCommand<'a, C: Ord, L, V> {
-    value: Rc<V>,
-    registry_entry: btree_map::OccupiedEntry<'a, Rc<C>, ContextRecord<C, L, V>>,
-    value_command: ValueCommand<'a, C, L, V>,
-}
-
-impl<'a, C: Ord, L, V> Command for OverwriteCommand<'a, C, L, V> {
-    fn execute(self) {
-        let OverwriteCommand {
-            value,
-            mut registry_entry,
-            value_command,
-        } = self;
-
-        registry_entry.get_mut().value = Some(value);
-
-        value_command.execute();
-    }
-}
 
 /// ## InsertionCommands are determined by the following:
 ///
@@ -207,82 +165,53 @@ impl<'a, C: Ord, L, V> Command for OverwriteCommand<'a, C, L, V> {
 ///
 /// | ↓ value / context →         | Same Context                               | Later Context                          |
 /// |-----------------------------|--------------------------------------------|----------------------------------------|
-/// | `None` -> `Some(new_value)` | [`Overwrite`](InsertionCommand::Overwrite) | [`Update`](InsertionCommand::Update)   |
-/// | `Some(old_value)` -> `None` | N/A (Destructive)                          | [`Nullify`](InsertionCommand::Nullify) |
+/// | `None` -> `Some(new_value)` | Overwrite                                  | Update                                 |
+/// | `Some(old_value)` -> `None` | N/A (Destructive)                          | Nullify                                |
 ///
 ///
-/// All commands that insert `Some<V>`, i.e., [`NewLink`](InsertionCommand::NewLink),
-/// [`Overwrite`](InsertionCommand::Overwrite), [`Update`](), may clash with existing links, which,
-/// if existing, must be Nullified. As nullifying a ContextRegistry does not link `Some(V)`, it will
-/// not clash. As such, every insertion operation should trigger at most two commands, the first to
-/// associate the new link with the value, the second to nullify the old link.
-enum InsertionCommand<'a, C: Ord, L, V> {
-    NewLink(NewLinkCommand<'a, C, L, V>),
-    Update(UpdateCommand<'a, C, L, V>),
-    Nullify(NullifyCommand<'a, C, L, V>),
-    Overwrite(OverwriteCommand<'a, C, L, V>),
+#[derive(Debug)]
+pub enum InsertionOk {
+    NewLink,
+    Update,
+    Nullify,
+    Overwrite,
     NoChange,
 }
 
-impl<'a, C: Ord, L, V> Command for InsertionCommand<'a, C, L, V> {
-    fn execute(self) {
-        match self {
-            InsertionCommand::NewLink(command) => command.execute(),
-            InsertionCommand::Update(command) => command.execute(),
-            InsertionCommand::Nullify(command) => command.execute(),
-            InsertionCommand::Overwrite(command) => command.execute(),
-            InsertionCommand::NoChange => {}
-        }
+#[derive(Debug)]
+pub enum ValueUpdateOk<C, L, V> {
+    NoExistingRegistry {
+        new_value: Some<Rc<V>>,
+        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>
+    },
+    NullifyWith {
+        existing_value: Some<Rc<V>>,
+        new_value: Some<Rc<V>>,
+        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>
     }
 }
 
-enum ValueCommand<'a, C: Ord, L, V> {
-    Vacant {
-        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
-        vacant_values_to_registries_entry:
-            hash_map::VacantEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
-    },
-    Occupied {
-        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>,
-        vacant_values_to_registries_entry:
-            hash_map::VacantEntry<'a, Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>,
-        nullify_command: NullifyCommand<'a, C, L, V>,
-    },
-}
+// trait Command where Self: Sized{
+//     fn execute<C: Ord, L, V>(self, &mut context_map: ContextMap<C, L, V>) {}
+// }
+//
+// impl<V> Command for ValueUpdateOk<V> {
+//     fn execute<C: Ord, L, V>(self, &mut context_map: ContextMap<C, L, V>) {
+//         match
+//     }
+// }
+//
 
-
-impl<'a, C: Ord, L, V> Command for ValueCommand<'a, C, L, V> {
-    fn execute(self) {
-        match self {
-            ValueCommand::Vacant {
-                new_registry,
-                vacant_values_to_registries_entry,
-            } => {
-                vacant_values_to_registries_entry.insert(new_registry);
-            }
-            ValueCommand::Occupied {
-                new_registry,
-                nullify_command,
-            } => {
-                nullify_command.execute();
-            }
-        }
-    }
-}
 
 #[derive(Debug)]
-enum RecordToEntryError {
+pub enum InsertionError {
     OutdatedContext,
     OverwritingSome,
+    NullifyingSome,
 }
 
-impl Display for RecordToEntryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl Error for RecordToEntryError {}
+use hash_map::Entry::{Occupied, Vacant};
+use std::collections::hash_map::{Entry, VacantEntry};
 
 impl<L, C, V> ContextMap<L, C, V>
 where
@@ -290,103 +219,197 @@ where
     C: Ord + Debug,
     V: Hash + Eq + Debug,
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             links_to_registries: HashMap::<Rc<L>, Rc<RefCell<ContextRegistry<C, L, V>>>>::new(),
             values_to_registries: HashMap::<Rc<V>, Rc<RefCell<ContextRegistry<C, L, V>>>>::new(),
         }
     }
 
-    fn gen_value_command<'a>(
+    pub fn query(&self, context: &C, link: &L) -> Option<ContextRecord<C, L, V>> {
+        self.links_to_registries.get(link).and_then(|r| r.borrow().query(context).cloned())
+    }
+
+    pub fn contains_live_link(&self, link: &Rc<L>) -> bool {
+        self.links_to_registries.contains_key(link)
+    }
+    pub fn contains_live_value(&self, value: &Rc<V>) -> bool {
+        self.values_to_registries.contains_key(value)
+    }
+
+
+    pub fn insert(
         &mut self,
-        link: Rc<L>,
-        context: Rc<C>,
-        new_value: Rc<V>,
-        new_registry: Rc<RefCell<ContextRegistry<C, L, V>>>, 
-    ) -> ValueCommand<'a, C, L, V> {
-        let entry = self.values_to_registries.entry(new_value);
-        match entry {
-            hash_map::Entry::Occupied(occupied_entry) => ValueCommand::Occupied {
-                new_registry,
-                nullify_command: NullifyCommand {
-                    link,
-                    context,
-                    values_to_registries_entry: occupied_entry,
-                },
-            },
-            hash_map::Entry::Vacant(vacant_entry) => ValueCommand::Vacant {
-                vacant_values_to_registries_entry: vacant_entry,
-            },
+        context: C,
+        link: L,
+        value: V,
+    ) -> Result<InsertionOk, InsertionError> {
+        self.try_insert_rc(context.into(), link.into(), value.into())
+    }
+
+    fn execute_value_map_update_command(&mut self, command: ValueUpdateOk<V>) {
+        match command {
+            ValueUpdateOk::NoExistingRegistry {  } => {
+            }
+            ValueUpdateOk::NullifyWith { existing_value, new_value } => {
+                self.val
+            }
+        }
+
+    }
+
+    fn generate_value_map_update_command(&self, context: &Rc<C>, link: &Rc<L>, value: Option<&Rc<V>>) -> Result<ValueUpdateOk, InsertionError> {
+        let existing_registry = match self.values_to_registries.get(value) {
+            Some(registry) => {
+                registry.clone()
+            }
+            None => {
+                return Ok(ValueUpdateOk::NoExistingRegistry);
+            }
+        };
+        let borrow = registry.borrow();
+        let existing_context = registry.borrow().context();
+        let existing_value = registry.borrow().value().clone();
+
+        match context.cmp(existing_context) {
+            Ordering::Less => {
+                Err(InsertionError::OutdatedContext)
+            }
+            Ordering::Equal => {
+                Err(InsertionError::OverwritingSome)
+            }
+            Ordering::Greater => {
+                Ok(ValueUpdateOk::NullifyWith {
+                    existing_value,
+                    new_value: value.clone(),
+                })
+            }
         }
     }
 
-    fn generate_command(
+    fn try_insert_rc(
         &mut self,
         context: Rc<C>,
         link: Rc<L>,
         value: Rc<V>,
-    ) -> Result<InsertionCommand<C, L, V>, RecordToEntryError> {
-        // So long as we can assure that we never pass the same
-        let linked_registry_entry = self.links_to_registries.entry(link);
-        let valued_registry_entry = self.values_to_registries.entry(value);
+    ) -> Result<InsertionOk, InsertionError> {
+        {
+            // The link and value already point to the same registry, they are already associated.
+            if let (Some(link_registry), Some(value_registry)) = (self.links_to_registries.get(&link), self.values_to_registries.get(&value)) && std::ptr::eq(link_registry, value_registry) {
+                return Ok(InsertionOk::NoChange);
+            }
 
-        match (linked_registry_entry, valued_registry_entry) {
-            (
-                hash_map::Entry::Occupied(linked_registry_occupied),
-                hash_map::Entry::Occupied(valued_registry_occupied),
-            ) => {
-                if std::ptr::eq(
-                    linked_registry_occupied.get(),
-                    valued_registry_occupied.get(),
-                ) {
-                    // The link and value already point to the same registry, they are already associated.
-                    return Ok(InsertionCommand::NoChange);
-                } else {
-                    let value_command = todo!();
-                    let update_command = UpdateCommand {
-                        link,
-                        context,
-                        value,
-                        value_command,
-                        context_registry: linked_registry_occupied.get().get_mut(),
-                    };
-                    Ok(InsertionCommand::Update(update_command));
-                }
+            // If there is a value registry to be nullified (i.e. Some(_)), the overwriting context
+            // must not be less than or equal to the existing context
+            match valued_context.as_ref().map(|lc| context.cmp(lc)) {
+                Some(Ordering::Less) => return Err(InsertionError::OutdatedContext),
+                // Valued_registries are necessarily some-valued, so we would be nullifying Some.
+                Some(Ordering::Equal) => return Err(InsertionError::NullifyingSome),
+                _ => {}
             }
-            (
-                hash_map::Entry::Occupied(occupied_link_registry_entry),
-                hash_map::Entry::Occupied(occupied_value_registry_entry),
-            ) => {}
-            (hash_map::Entry::Occupied(_), hash_map::Entry::Vacant(_)) => {
-                // link registry => Ok: update, overwrite || Err: overwritesome, or context
-            }
-            (hash_map::Entry::Vacant(_), hash_map::Entry::Occupied(_)) => todo!(),
-            (hash_map::Entry::Vacant(_), hash_map::Entry::Vacant(_)) => todo!(),
         }
 
-        // is there an existing link (if not, NewLink, otherwise, can we overwrite / update?)
-        // does the value exist in another link
+        // Handle linked
 
-        // if let hash_map::Entry::Occupied(occupied_value_registry_entry) = value_registry_entry
-        // && let  Some((old_value_context, _)) = occupied_value_registry_entry.get().borrow().last_key_value()
-        // && &context < old_value_context {
-        // return Err(RecordToEntryError::OutdatedContext);
-        // };
-    }
 
-    fn insert_record(&mut self, link: L, record: ContextRecord<C, L, V>)
-    /*  -> Result<(), Box<dyn Error>> */
-    {
-        let link_registry = self.links_to_registries.get(&link);
-        let value_registry = record.value.and_then(|v| self.values_to_registries.get(&v));
+        let linked_registry_option = self.links_to_registries.get(&link);
+        if linked_registry_option == None {
+            self.unchecked_new_link(&context, &link, &value);
+            return Ok(InsertionOk::NewLink);
+        };
+        let linked_registry = linked_registry_option.unwrap();
 
-        match (link_registry, value_registry) {
-            //Need to create new registry.
-            (None, None) => link_registry = todo!(),
-            (None, Some(value_registry)) => todo!(),
-            (None, Some(value_registry)) => todo!(),
-            (Some(_), None) => todo!(),
-            (Some(_), Some(_)) => todo!(),
+        let linked_context = linked_registry.borrow().context().clone();
+        match context.cmp(&linked_context) {
+            Ordering::Less => {
+                Err(InsertionError::OutdatedContext)
+            }
+            Ordering::Equal => {
+                self.overwrite_unchecked(&context, &link, &value)
+            }
+            Ordering::Greater => {
+                // Update
+                self.unchecked_update(&context, &link, &value)
+            }
         }
     }
+
+    fn overwrite_unchecked(&mut self, context: &Rc<C>, link: &Rc<L>, value: &Rc<V>) -> Result<InsertionOk, InsertionError> {
+        let linked_registry = self.links_to_registries.get(&link).unwrap();
+        let mut linked_registry_mut = linked_registry.borrow_mut();
+        let linked_record = linked_registry_mut
+            .get_mut(&context)
+            .expect("Equal cmp means there is a record at this context");
+        if linked_record.value.is_none() {
+            // Overwrite
+            linked_record.value = Some(value.clone());
+
+            // Record that this value points to the registry which now contains it
+            self.values_to_registries
+                .insert(value.clone(), linked_registry.clone());
+
+            Ok(InsertionOk::NewLink)
+        } else {
+            Err(InsertionError::OverwritingSome)
+        }
+    }
+
+    fn unchecked_new_link(&mut self, context: &Rc<C>, link: &Rc<L>, value: &Rc<V>) {
+        let entry = self.values_to_registries.entry(value.clone());
+        // NewLink
+        let new_linked_registry = Rc::new(RefCell::new(ContextRegistry::new(
+            context.clone(),
+            link.clone(),
+            value.clone(),
+        )));
+        vacant_links_to_registries_entry.insert(new_linked_registry.clone());
+        match entry {
+            Occupied(old_values_to_registries_entry) => {
+                // Point the value to the new registry, and get the old registry out...
+                let old_valued_registry = old_values_to_registries_entry
+                    .replace_entry(new_linked_registry)
+                    .1;
+
+                // So we can nullify it
+                old_valued_registry
+                    .borrow_mut()
+                    .insert(context.clone(), ContextRecord::new_none(&&&context, &&&link));
+            }
+            Vacant(valued_registry_vacant_entry) => {
+                // Point the value to the
+                valued_registry_vacant_entry.insert(new_linked_registry);
+            }
+        }
+    }
+
+    fn unchecked_update(&mut self, context: &Rc<C>, link: &Rc<L>, value: &Rc<V>) -> Result<InsertionOk, InsertionError> {
+        let linked_registry = self.links_to_registries.get(link).unwrap();
+        let new_record = ContextRecord::new_some(&context, &link, &value);
+        let old_value_option = linked_registry.borrow_mut().insert(context.clone(), new_record).value.clone();
+        if let Some(old_value) = old_value_option
+            && let Occupied(entry) = self.values_to_registries.entry(old_value) {
+            entry.replace_entry(linked_registry.clone());
+        };
+        Ok(InsertionOk::Update)
+    }
+}
+
+#[test]
+fn insert_test() {
+    let mut context_map = ContextMap::<u32, u32, u32>::new();
+    context_map.insert(0, 0, 0).unwrap();
+    dbg!(&context_map);
+    context_map.insert(1, 1, 1).unwrap();
+    dbg!(&context_map);
+    context_map.insert(2, 1, 0).unwrap();
+    dbg!(&context_map);
+
+    dbg!(context_map.query(&0, &0));
+    dbg!(context_map.query(&1, &0));
+    dbg!(context_map.query(&1, &0));
+
+
+    dbg!(context_map.query(&0, &1));
+    dbg!(context_map.query(&1, &1));
+    dbg!(context_map.query(&1, &1));
 }
